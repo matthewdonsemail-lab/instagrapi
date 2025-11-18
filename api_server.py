@@ -9,7 +9,6 @@ app = FastAPI(title="Instagrapi Followers API")
 cl = Client()
 
 SESSIONID = os.getenv("IG_SESSIONID")
-
 if not SESSIONID:
     raise RuntimeError("IG_SESSIONID env var must be set")
 
@@ -31,9 +30,9 @@ def get_followers(username: str, amount: int = 50):
         user_id = cl.user_id_from_username(username)
         followers = cl.user_followers(user_id, amount=amount)
     except Exception as e:
+        # Bubble up the error so you can see it in the response if IG/login fails
         raise HTTPException(status_code=500, detail=str(e))
 
-    # followers is a dict keyed by pk
     out = []
     for pk, user in followers.items():
         out.append(
@@ -42,7 +41,7 @@ def get_followers(username: str, amount: int = 50):
                 "username": user.username,
                 "full_name": user.full_name,
                 "is_private": user.is_private,
-                "is_verified": user.is_verified,
+                "profile_pic_url": str(user.profile_pic_url) if user.profile_pic_url else None,
             }
         )
     return out
