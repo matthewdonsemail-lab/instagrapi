@@ -101,6 +101,37 @@ async def user_info_by_username(username: str):
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+# --- NEW: FOLLOWER COUNT ENDPOINTS ------------------------------------------
+
+@app.get("/user/{user_id}/followers_count")
+async def user_followers_count(user_id: int):
+    """Get total follower count by user_id"""
+    try:
+        user = cl.user_info(user_id)
+        return {
+            "user_id": user_id,
+            "username": user.username,
+            "follower_count": user.follower_count,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/user/followers_count/by_username/{username}")
+async def user_followers_count_by_username(username: str):
+    """Get total follower count by username"""
+    try:
+        username = strip_username(username)
+        user = cl.user_info_by_username(username)
+        return {
+            "user_id": user.pk,
+            "username": user.username,
+            "follower_count": user.follower_count,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+# ---------------------------------------------------------------------------
+
 @app.get("/user/{user_id}/followers")
 async def user_followers(user_id: int, amount: int = Query(0, ge=0, description="0 = all followers")):
     """Get user's followers"""
