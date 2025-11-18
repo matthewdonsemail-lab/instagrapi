@@ -1,540 +1,571 @@
-import os
-import threading
-from typing import List, Optional
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
-
+"""
+Complete Instagrapi REST API Server
+Implements all major endpoints from the instagrapi library
+"""
+from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from instagrapi import Client
-from instagrapi.exceptions import (
-    UserNotFound,
-    PrivateAccount,
-    DirectThreadNotFound,
-    DirectMessageNotFound,
-)
+from instagrapi.exceptions import ClientError
+from instagrapi.types import Usertag, Location, StoryMention, StoryLink, StoryHashtag
+from typing import List, Optional, Dict, Any
+from pathlib import Path
+from pydantic import BaseModel
+import os
+import tempfile
 
-# Read session id from environment (set this in Railway)
-INSTAGRAM_SESSION_ID = os.environ.get("INSTAGRAM_SESSION_ID")
+app = FastAPI(title="Instagrapi REST API", version="1.0.0")
 
-_client: Optional[Client] = None
-_client_lock = threading.Lock()
+# Initialize client
+cl = Client()
+sessionid = os.getenv("IG_SESSIONID")
+if sessionid:
+    cl.login_by_sessionid(sessionid)
 
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
-def get_client() -> Client:
-    """
-    Lazily initialise a single Client instance using INSTAGRAM_SESSION_ID.
-    """
-    global _client
+def strip_username(username: str) -> str:
+    """Strip trailing slashes and @ symbols from username"""
+    return username.strip().rstrip('/').lstrip('@')
 
-    if _client is not None:
-        return _client
+def convert_user_short(user):
+    """Convert UserShort object to dict"""
+    return {
+        "pk": user.pk,
+        "username": user.username,
+        "full_name": user.full_name,
+        "is_private": user.is_private,
+        "profile_pic_url": str(user.profile_pic_url) if user.profile_pic_url else None
+    }
 
-    if not INSTAGRAM_SESSION_ID:
-        raise RuntimeError(
-            "INSTAGRAM_SESSION_ID environment variable is not set. "
-            "Set it in your Railway project variables."
-        )
+def convert_media(media):
+    """Convert Media object to dict"""
+    return {
+        "pk": media.pk,
+        "id": media.id,
+        "code": media.code,
+        "taken_at": media.taken_at.isoformat() if media.taken_at else None,
+        "media_type": media.media_type,
+        "product_type": media.product_type,
+        "thumbnail_url": str(media.thumbnail_url) if media.thumbnail_url else None,
+        "location": media.location.dict() if media.location else None,
+        "user": convert_user_short(media.user) if media.user else None,
+        "comment_count": media.comment_count,
+        "like_count": media.like_count,
+        "caption_text": media.caption_text,
+        "video_url": str(media.video_url) if media.video_url else None,
+        "view_count": media.view_count,
+        "video_duration": media.video_duration
+    }
 
-    with _client_lock:
-        if _client is not None:
-            return _client
+# ============================================================================
+# USER ENDPOINTS
+# ============================================================================
 
-        cl = Client()
-        # Login using session id (recommended way from docs)
-        cl.login_by_sessionid(INSTAGRAM_SESSION_ID)
-        _client = cl
-        return cl
-
-
-app = FastAPI(
-    title="Instagrapi API",
-    version="0.2.1",
-    description="REST API around instagrapi for followers/following, user stats and Direct messages.",
-)
-
-
-# ---------- Pydantic models ----------
-
-class UserShortOut(BaseModel):
-    pk: int
-    username: str
-    full_name: str
-    is_private: Optional[bool] = None
-    profile_pic_url: Optional[str] = None
-
-
-class UserOut(BaseModel):
-    pk: int
-    username: str
-    full_name: str
-    is_private: bool
-    profile_pic_url: Optional[str] = None
-    is_verified: Optional[bool] = None
-    media_count: Optional[int] = None
-    follower_count: Optional[int] = None
-    following_count: Optional[int] = None
-    biography: Optional[str] = None
-    external_url: Optional[str] = None
-    is_business: Optional[bool] = None
-
-
-class UserStatsOut(BaseModel):
-    """
-    Lightweight view that lets you very quickly know
-    how big an account is without pulling all followers.
-    """
-    pk: int
-    username: str
-    follower_count: Optional[int] = None
-    following_count: Optional[int] = None
-    media_count: Optional[int] = None
-    is_private: Optional[bool] = None
-    is_business: Optional[bool] = None
-
-
-class DirectSendRequest(BaseModel):
-    text: str
-    usernames: Optional[List[str]] = None
-    user_ids: Optional[List[int]] = None
-    thread_ids: Optional[List[int]] = None
-
-
-class DirectReplyRequest(BaseModel):
-    text: str
-
-
-class BlockResponse(BaseModel):
-    username: str
-    user_id: int
-    blocked: bool
-
-
-# ---------- Health ----------
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
-
-
-# ---------- Followers / Following / User info ----------
-
-@app.get("/followers/{username}", response_model=List[UserShortOut])
-def get_followers(
-    username: str,
-    amount: int = Query(
-        10,
-        ge=0,
-        le=10000,
-        description="How many followers to return. 0 = ALL followers (slow on big accounts!)",
-    ),
-):
-    """
-    Return up to `amount` followers for the given username.
-
-    Uses cl.user_followers() which returns Dict[int, UserShort].
-
-    NOTE:
-    - amount=0 means "all followers" per instagrapi docs.
-      This is naturally slower for large accounts because it has to paginate.
-    """
-    cl = get_client()
-
+@app.get("/user/id_from_username/{username}")
+async def user_id_from_username(username: str):
+    """Get user_id from username"""
     try:
+        username = strip_username(username)
         user_id = cl.user_id_from_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
+        return {"user_id": user_id, "username": username}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"User not found: {str(e)}")
 
+@app.get("/user/username_from_id/{user_id}")
+async def username_from_user_id(user_id: int):
+    """Get username from user_id"""
     try:
-        followers = cl.user_followers(user_id, amount=amount or 0)
-    except PrivateAccount:
-        raise HTTPException(status_code=403, detail="Account is private")
+        username = cl.username_from_user_id(user_id)
+        return {"user_id": user_id, "username": username}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"User not found: {str(e)}")
 
-    result: List[UserShortOut] = []
-    for pk, user in followers.items():
-        result.append(
-            UserShortOut(
-                pk=pk,
-                username=user.username,
-                full_name=user.full_name,
-                is_private=getattr(user, "is_private", None),
-                profile_pic_url=str(user.profile_pic_url)
-                if getattr(user, "profile_pic_url", None)
-                else None,
-            )
-        )
-    return result
-
-
-@app.get("/following/{username}", response_model=List[UserShortOut])
-def get_following(
-    username: str,
-    amount: int = Query(
-        10,
-        ge=0,
-        le=10000,
-        description="How many accounts to return. 0 = ALL following (slow on big accounts!)",
-    ),
-):
-    """
-    Return up to `amount` accounts this user is following.
-    Uses cl.user_following().
-    """
-    cl = get_client()
-
+@app.get("/user/info/{user_id}")
+async def user_info(user_id: int):
+    """Get full user info by user_id"""
     try:
-        user_id = cl.user_id_from_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
+        user = cl.user_info(user_id)
+        return user.dict()
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
+@app.get("/user/info_by_username/{username}")
+async def user_info_by_username(username: str):
+    """Get full user info by username"""
     try:
-        following = cl.user_following(user_id, amount=amount or 0)
-    except PrivateAccount:
-        raise HTTPException(status_code=403, detail="Account is private")
-
-    result: List[UserShortOut] = []
-    for pk, user in following.items():
-        result.append(
-            UserShortOut(
-                pk=pk,
-                username=user.username,
-                full_name=user.full_name,
-                is_private=getattr(user, "is_private", None),
-                profile_pic_url=str(user.profile_pic_url)
-                if getattr(user, "profile_pic_url", None)
-                else None,
-            )
-        )
-    return result
-
-
-@app.get("/followers/{username}/search", response_model=List[UserShortOut])
-def search_followers(
-    username: str,
-    q: str = Query(..., min_length=1),
-    amount: int = Query(50, ge=1, le=1000),
-):
-    """
-    Search within followers of a user using cl.search_followers().
-
-    This does NOT fetch all followers first – it uses the built-in search
-    which is much faster when you only care about matches for a query
-    like 'factory'.
-    """
-    cl = get_client()
-
-    try:
-        user_id = cl.user_id_from_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    followers = cl.search_followers(user_id=user_id, query=q)
-    followers = followers[:amount]
-
-    result: List[UserShortOut] = []
-    for user in followers:
-        result.append(
-            UserShortOut(
-                pk=user.pk,
-                username=user.username,
-                full_name=user.full_name,
-                is_private=getattr(user, "is_private", None),
-                profile_pic_url=str(user.profile_pic_url)
-                if getattr(user, "profile_pic_url", None)
-                else None,
-            )
-        )
-    return result
-
-
-@app.get("/following/{username}/search", response_model=List[UserShortOut])
-def search_following(
-    username: str,
-    q: str = Query(..., min_length=1),
-    amount: int = Query(50, ge=1, le=1000),
-):
-    """
-    Search within following of a user using cl.search_following().
-    """
-    cl = get_client()
-
-    try:
-        user_id = cl.user_id_from_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    following = cl.search_following(user_id=user_id, query=q)
-    following = following[:amount]
-
-    result: List[UserShortOut] = []
-    for user in following:
-        result.append(
-            UserShortOut(
-                pk=user.pk,
-                username=user.username,
-                full_name=user.full_name,
-                is_private=getattr(user, "is_private", None),
-                profile_pic_url=str(user.profile_pic_url)
-                if getattr(user, "profile_pic_url", None)
-                else None,
-            )
-        )
-    return result
-
-
-@app.get("/users/{username}", response_model=UserOut)
-def get_user(username: str):
-    """
-    Full user profile info using cl.user_info_by_username().
-
-    Use this when you want follower_count / following_count etc,
-    but you do NOT need the full follower list.
-    """
-    cl = get_client()
-
-    try:
+        username = strip_username(username)
         user = cl.user_info_by_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
+        return user.dict()
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-    return UserOut(
-        pk=user.pk,
-        username=user.username,
-        full_name=user.full_name,
-        is_private=user.is_private,
-        profile_pic_url=str(user.profile_pic_url)
-        if getattr(user, "profile_pic_url", None)
-        else None,
-        is_verified=getattr(user, "is_verified", None),
-        media_count=getattr(user, "media_count", None),
-        follower_count=getattr(user, "follower_count", None),
-        following_count=getattr(user, "following_count", None),
-        biography=getattr(user, "biography", None),
-        external_url=str(user.external_url)
-        if getattr(user, "external_url", None)
-        else None,
-        is_business=getattr(user, "is_business", None),
-    )
-
-
-@app.get("/users/{username}/stats", response_model=UserStatsOut)
-def get_user_stats(username: str):
-    """
-    Super-lightweight stats endpoint.
-
-    This calls cl.user_info_by_username() once and only returns the fields
-    you usually care about for sizing an account:
-    follower_count, following_count, media_count, is_private, is_business.
-    """
-    cl = get_client()
-
+@app.get("/user/{user_id}/followers")
+async def user_followers(user_id: int, amount: int = Query(0, ge=0, description="0 = all followers")):
+    """Get user's followers"""
     try:
-        user = cl.user_info_by_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
+        followers = cl.user_followers(user_id, amount)
+        return [convert_user_short(user) for user in followers.values()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return UserStatsOut(
-        pk=user.pk,
-        username=user.username,
-        follower_count=getattr(user, "follower_count", None),
-        following_count=getattr(user, "following_count", None),
-        media_count=getattr(user, "media_count", None),
-        is_private=getattr(user, "is_private", None),
-        is_business=getattr(user, "is_business", None),
-    )
+@app.get("/user/{user_id}/following")
+async def user_following(user_id: int, amount: int = Query(0, ge=0, description="0 = all following")):
+    """Get user's following"""
+    try:
+        following = cl.user_following(user_id, amount)
+        return [convert_user_short(user) for user in following.values()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/following/{username}/search")
+async def search_following(
+    username: str,
+    q: str = Query(..., min_length=1, description="Search query"),
+    amount: int = Query(50, ge=1, le=1000)
+):
+    """Search within following of a user"""
+    try:
+        username = strip_username(username)
+        user_id = cl.user_id_from_username(username)
+        results = cl.search_following(user_id, q)
+        return [convert_user_short(user) for user in results[:amount]]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- Direct: threads, messages, send, reply, unsend ----------
+@app.get("/followers/{username}/search")
+async def search_followers(
+    username: str,
+    q: str = Query(..., min_length=1, description="Search query"),
+    amount: int = Query(50, ge=1, le=1000)
+):
+    """Search within followers of a user"""
+    try:
+        username = strip_username(username)
+        user_id = cl.user_id_from_username(username)
+        results = cl.search_followers(user_id, q)
+        return [convert_user_short(user) for user in results[:amount]]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/follow")
+async def user_follow(user_id: int):
+    """Follow a user"""
+    try:
+        result = cl.user_follow(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/unfollow")
+async def user_unfollow(user_id: int):
+    """Unfollow a user"""
+    try:
+        result = cl.user_unfollow(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/remove_follower")
+async def user_remove_follower(user_id: int):
+    """Remove a follower"""
+    try:
+        result = cl.user_remove_follower(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/mute_posts")
+async def mute_posts_from_follow(user_id: int):
+    """Mute posts from following user"""
+    try:
+        result = cl.mute_posts_from_follow(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/unmute_posts")
+async def unmute_posts_from_follow(user_id: int):
+    """Unmute posts from following user"""
+    try:
+        result = cl.unmute_posts_from_follow(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/mute_stories")
+async def mute_stories_from_follow(user_id: int):
+    """Mute stories from following user"""
+    try:
+        result = cl.mute_stories_from_follow(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/close_friend/add")
+async def close_friend_add(user_id: int):
+    """Add user to close friends list"""
+    try:
+        result = cl.close_friend_add(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/{user_id}/close_friend/remove")
+async def close_friend_remove(user_id: int):
+    """Remove user from close friends list"""
+    try:
+        result = cl.close_friend_remove(user_id)
+        return {"success": result, "user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# MEDIA ENDPOINTS
+# ============================================================================
+
+@app.get("/media/pk_from_code/{code}")
+async def media_pk_from_code(code: str):
+    """Get media_pk from short code"""
+    try:
+        media_pk = cl.media_pk_from_code(code)
+        return {"media_pk": media_pk, "code": code}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/media/pk_from_url")
+async def media_pk_from_url(url: str = Query(..., description="Instagram media URL")):
+    """Get media_pk from URL"""
+    try:
+        media_pk = cl.media_pk_from_url(url)
+        return {"media_pk": media_pk, "url": url}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/media/info/{media_pk}")
+async def media_info(media_pk: int):
+    """Get media info"""
+    try:
+        media = cl.media_info(media_pk)
+        return media.dict()
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/user/{user_id}/medias")
+async def user_medias(user_id: int, amount: int = Query(20, ge=1, le=100)):
+    """Get user's medias"""
+    try:
+        medias = cl.user_medias(user_id, amount)
+        return [convert_media(media) for media in medias]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/user/{user_id}/clips")
+async def user_clips(user_id: int, amount: int = Query(50, ge=1, le=100)):
+    """Get user's clips/reels"""
+    try:
+        clips = cl.user_clips(user_id, amount)
+        return [convert_media(clip) for clip in clips]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/media/{media_pk}/like")
+async def media_like(media_pk: int):
+    """Like a media"""
+    try:
+        media_id = cl.media_id(media_pk)
+        result = cl.media_like(media_id)
+        return {"success": result, "media_pk": media_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/media/{media_pk}/unlike")
+async def media_unlike(media_pk: int):
+    """Unlike a media"""
+    try:
+        media_id = cl.media_id(media_pk)
+        result = cl.media_unlike(media_id)
+        return {"success": result, "media_pk": media_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/media/{media_pk}")
+async def media_delete(media_pk: int):
+    """Delete a media"""
+    try:
+        result = cl.media_delete(media_pk)
+        return {"success": result, "media_pk": media_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/media/{media_pk}/archive")
+async def media_archive(media_pk: int):
+    """Archive a media"""
+    try:
+        media_id = cl.media_id(media_pk)
+        result = cl.media_archive(media_id)
+        return {"success": result, "media_pk": media_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/media/{media_pk}/unarchive")
+async def media_unarchive(media_pk: int):
+    """Unarchive a media"""
+    try:
+        media_id = cl.media_id(media_pk)
+        result = cl.media_unarchive(media_id)
+        return {"success": result, "media_pk": media_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/media/{media_pk}/likers")
+async def media_likers(media_pk: int):
+    """Get users who liked a media"""
+    try:
+        media_id = cl.media_id(media_pk)
+        likers = cl.media_likers(media_id)
+        return [convert_user_short(user) for user in likers]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/media/download/{media_pk}")
+async def media_download(media_pk: int):
+    """Download media (photo/video)"""
+    try:
+        media = cl.media_info(media_pk)
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        if media.media_type == 1:  # Photo
+            path = cl.photo_download(media_pk, folder=temp_dir)
+        elif media.media_type == 2 and media.product_type == "feed":  # Video
+            path = cl.video_download(media_pk, folder=temp_dir)
+        elif media.media_type == 2 and media.product_type == "igtv":  # IGTV
+            path = cl.igtv_download(media_pk, folder=temp_dir)
+        elif media.media_type == 2 and media.product_type == "clips":  # Reels
+            path = cl.clip_download(media_pk, folder=temp_dir)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported media type")
+        
+        return FileResponse(path, filename=path.name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# COMMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/media/{media_pk}/comments")
+async def media_comments(media_pk: int, amount: int = Query(0, ge=0)):
+    """Get comments on a media (0 = all comments)"""
+    try:
+        media_id = cl.media_id(media_pk)
+        comments = cl.media_comments(media_id, amount)
+        return [comment.dict() for comment in comments]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class CommentCreate(BaseModel):
+    text: str
+    replied_to_comment_id: Optional[int] = None
+
+@app.post("/media/{media_pk}/comment")
+async def media_comment(media_pk: int, comment_data: CommentCreate):
+    """Add a comment to media"""
+    try:
+        media_id = cl.media_id(media_pk)
+        comment = cl.media_comment(
+            media_id, 
+            comment_data.text,
+            replied_to_comment_id=comment_data.replied_to_comment_id
+        )
+        return comment.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/comment/{comment_pk}/like")
+async def comment_like(comment_pk: int):
+    """Like a comment"""
+    try:
+        result = cl.comment_like(comment_pk)
+        return {"success": result, "comment_pk": comment_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/comment/{comment_pk}/unlike")
+async def comment_unlike(comment_pk: int):
+    """Unlike a comment"""
+    try:
+        result = cl.comment_unlike(comment_pk)
+        return {"success": result, "comment_pk": comment_pk}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/media/{media_pk}/comments")
+async def comment_bulk_delete(media_pk: int, comment_pks: List[int] = Body(...)):
+    """Delete multiple comments"""
+    try:
+        media_id = cl.media_id(media_pk)
+        result = cl.comment_bulk_delete(media_id, comment_pks)
+        return {"success": result, "deleted_count": len(comment_pks)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# DIRECT MESSAGE ENDPOINTS
+# ============================================================================
 
 @app.get("/direct/threads")
-def list_threads(
-    amount: int = Query(10, ge=1, le=100),
-    thread_message_limit: int = Query(10, ge=0, le=200),
+async def direct_threads(
+    amount: int = Query(20, ge=1, le=100),
+    selected_filter: str = Query("", description="Filter: '', 'flagged', or 'unread'")
 ):
-    """
-    List Direct threads using cl.direct_threads().
-    """
-    cl = get_client()
-    threads = cl.direct_threads(
-        amount=amount,
-        thread_message_limit=thread_message_limit,
-    )
-    return jsonable_encoder([t.dict() for t in threads])
-
-
-@app.get("/direct/threads/{thread_id}")
-def get_thread(
-    thread_id: int,
-    amount: int = Query(20, ge=1, le=200),
-):
-    """
-    Get a single Direct thread with last `amount` messages.
-    """
-    cl = get_client()
-
+    """Get all direct message threads"""
     try:
-        thread = cl.direct_thread(thread_id, amount=amount)
-    except DirectThreadNotFound:
-        raise HTTPException(status_code=404, detail="Thread not found")
+        threads = cl.direct_threads(amount, selected_filter)
+        return [thread.dict() for thread in threads]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return jsonable_encoder(thread.dict())
-
-
-@app.get("/direct/threads/{thread_id}/messages")
-def get_thread_messages(
-    thread_id: int,
-    amount: int = Query(20, ge=1, le=200),
-):
-    """
-    List messages in a Direct thread using cl.direct_messages().
-    """
-    cl = get_client()
-
+@app.get("/direct/pending")
+async def direct_pending_inbox(amount: int = Query(20, ge=1, le=100)):
+    """Get pending direct message threads"""
     try:
-        messages = cl.direct_messages(thread_id, amount=amount)
-    except DirectThreadNotFound:
-        raise HTTPException(status_code=404, detail="Thread not found")
+        threads = cl.direct_pending_inbox(amount)
+        return [thread.dict() for thread in threads]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return jsonable_encoder([m.dict() for m in messages])
+@app.get("/direct/thread/{thread_id}")
+async def direct_thread(thread_id: int, amount: int = Query(20, ge=1)):
+    """Get a specific thread with messages"""
+    try:
+        thread = cl.direct_thread(thread_id, amount)
+        return thread.dict()
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
+@app.get("/direct/thread/{thread_id}/messages")
+async def direct_messages(thread_id: int, amount: int = Query(20, ge=1)):
+    """Get messages in a thread"""
+    try:
+        messages = cl.direct_messages(thread_id, amount)
+        return [msg.dict() for msg in messages]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class DirectMessageSend(BaseModel):
+    text: str
+    user_ids: List[int] = []
+    thread_ids: List[int] = []
 
 @app.post("/direct/send")
-def send_direct_message(payload: DirectSendRequest):
-    """
-    Send a text Direct message.
-
-    Maps to cl.direct_send(text, user_ids=[...], thread_ids=[...])
-
-    - You can pass:
-      * usernames: list of Instagram usernames
-      * user_ids: list of numeric user IDs
-      * thread_ids: list of existing thread IDs (to send into a thread)
-    """
-    cl = get_client()
-
-    user_ids: List[int] = []
-    if payload.user_ids:
-        user_ids.extend(payload.user_ids)
-
-    if payload.usernames:
-        for username in payload.usernames:
-            try:
-                uid = cl.user_id_from_username(username)
-            except UserNotFound:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"User not found: {username}",
-                )
-            user_ids.append(uid)
-
-    if not user_ids and not payload.thread_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="You must provide at least one username/user_id or a thread_ids list.",
-        )
-
-    message = cl.direct_send(
-        payload.text,
-        user_ids=user_ids or None,
-        thread_ids=payload.thread_ids or None,
-    )
-
-    # direct_send returns DirectMessage
-    return jsonable_encoder(message.dict())
-
-
-@app.post("/direct/threads/{thread_id}/reply")
-def reply_to_thread(
-    thread_id: int,
-    payload: DirectReplyRequest,
-):
-    """
-    Reply into an existing Direct thread using cl.direct_answer().
-    """
-    cl = get_client()
-
+async def direct_send(message: DirectMessageSend):
+    """Send a direct message to users or threads"""
     try:
-        message = cl.direct_answer(thread_id, payload.text)
-    except DirectThreadNotFound:
-        raise HTTPException(status_code=404, detail="Thread not found")
+        result = cl.direct_send(message.text, message.user_ids, message.thread_ids)
+        return result.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return jsonable_encoder(message.dict())
-
-
-@app.delete("/direct/threads/{thread_id}/messages/{message_id}")
-def unsend_message(thread_id: int, message_id: int):
-    """
-    Unsend (delete) a Direct message using cl.direct_message_delete().
-    """
-    cl = get_client()
-
+@app.post("/direct/thread/{thread_id}/answer")
+async def direct_answer(thread_id: int, text: str = Body(..., embed=True)):
+    """Reply to a thread"""
     try:
-        ok = cl.direct_message_delete(thread_id, message_id)
-    except DirectMessageNotFound:
-        raise HTTPException(status_code=404, detail="Message not found")
+        result = cl.direct_answer(thread_id, text)
+        return result.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {"success": bool(ok)}
-
-
-# ---------- Block / Unblock ----------
-
-@app.post("/users/{username}/block", response_model=BlockResponse)
-def block_user(username: str):
-    """
-    Block a user.
-    Uses cl.user_block(user_id) if available in this instagrapi version.
-    """
-    cl = get_client()
-
+@app.get("/direct/search")
+async def direct_search(query: str = Query(..., min_length=1)):
+    """Search direct message threads"""
     try:
-        user_id = cl.user_id_from_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
+        results = cl.direct_search(query)
+        return [thread.dict() for thread in results]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    block_fn = getattr(cl, "user_block", None)
-    if not callable(block_fn):
-        raise HTTPException(
-            status_code=501,
-            detail="This instagrapi version does not expose user_block().",
-        )
-
-    blocked = bool(block_fn(user_id))
-    return BlockResponse(username=username, user_id=user_id, blocked=blocked)
-
-
-@app.post("/users/{username}/unblock", response_model=BlockResponse)
-def unblock_user(username: str):
-    """
-    Unblock a user.
-    Uses cl.user_unblock(user_id) if available in this instagrapi version.
-    """
-    cl = get_client()
-
+@app.delete("/direct/thread/{thread_id}")
+async def direct_thread_hide(thread_id: int):
+    """Delete (hide) a thread"""
     try:
-        user_id = cl.user_id_from_username(username)
-    except UserNotFound:
-        raise HTTPException(status_code=404, detail="User not found")
+        result = cl.direct_thread_hide(thread_id)
+        return {"success": result, "thread_id": thread_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    unblock_fn = getattr(cl, "user_unblock", None)
-    if not callable(unblock_fn):
-        raise HTTPException(
-            status_code=501,
-            detail="This instagrapi version does not expose user_unblock().",
-        )
+@app.post("/direct/thread/{thread_id}/mark_unread")
+async def direct_thread_mark_unread(thread_id: int):
+    """Mark a thread as unread"""
+    try:
+        result = cl.direct_thread_mark_unread(thread_id)
+        return {"success": result, "thread_id": thread_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    unblocked = bool(unblock_fn(user_id))
-    # `blocked` field is inverse of unblocked
-    return BlockResponse(username=username, user_id=user_id, blocked=not unblocked)
+@app.post("/direct/thread/{thread_id}/mute")
+async def direct_thread_mute(thread_id: int):
+    """Mute a thread"""
+    try:
+        result = cl.direct_thread_mute(thread_id)
+        return {"success": result, "thread_id": thread_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/direct/thread/{thread_id}/unmute")
+async def direct_thread_unmute(thread_id: int):
+    """Unmute a thread"""
+    try:
+        result = cl.direct_thread_unmute(thread_id)
+        return {"success": result, "thread_id": thread_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- Local dev entrypoint (Railway will ignore this) ----------
+@app.delete("/direct/message/{thread_id}/{message_id}")
+async def direct_message_delete(thread_id: int, message_id: int):
+    """Delete a message from thread"""
+    try:
+        result = cl.direct_message_delete(thread_id, message_id)
+        return {"success": result, "thread_id": thread_id, "message_id": message_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class MediaShare(BaseModel):
+    media_id: str
+    user_ids: List[int]
+
+@app.post("/direct/share/media")
+async def direct_media_share(share: MediaShare):
+    """Share a media to users via DM"""
+    try:
+        result = cl.direct_media_share(share.media_id, share.user_ids)
+        return result.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# HEALTH CHECK
+# ============================================================================
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "logged_in": cl.user_id is not None,
+        "user_id": cl.user_id if cl.user_id else None
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint - redirect to docs"""
+    return {
+        "message": "Instagrapi REST API",
+        "docs": "/docs",
+        "health": "/health"
+    }
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        "api_server:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080")),
-        reload=False,
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
