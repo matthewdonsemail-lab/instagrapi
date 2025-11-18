@@ -192,6 +192,22 @@ cl.video_upload_to_story(
 * [Challenge Resolver](https://subzeroid.github.io/instagrapi/usage-guide/challenge_resolver.html)
 * [Exceptions](https://subzeroid.github.io/instagrapi/exceptions.html)
 
+## Deploying the FastAPI wrapper to Railway
+
+The included `api_server.py` exposes a FastAPI app (with Swagger UI at `/docs`) that wraps a few `instagrapi` calls. If you want to deploy it on [Railway](https://railway.app/), use the steps below to avoid common pitfalls (missing environment variables or incorrect start commands cause most failed deploys).
+
+1. Ensure your repository contains `railway.json` (included in this repo) so Railway knows how to start the server. The config uses Nixpacks with this command: `uvicorn api_server:app --host 0.0.0.0 --port $PORT`.
+2. In your Railway project, add an `IG_SESSIONID` **environment variable**. The API server will crash on boot if this is absent because it logs in via `Client.login_by_sessionid`.
+3. Set the Python version to something supported by Instagrapi (for example `3.11`). In the Railway dashboard, add a variable `NIXPACKS_PYTHON_VERSION=3.11` if you want to pin the runtime.
+4. Deploy the repo as a service. Railway installs `requirements.txt` during the build and then runs the start command from `railway.json`.
+5. After the deploy succeeds, open the service URL and check `/health` for a simple status check, and `/docs` for the interactive Swagger UI.
+
+If the deployment fails:
+
+* **Missing env vars**: make sure `IG_SESSIONID` is present and valid.
+* **Port binding issues**: the start command binds to `0.0.0.0` and uses `$PORT`, which Railway injects automatically; do not hardcode another port.
+* **Dependency problems**: rerun the deploy after confirming `fastapi` and `uvicorn[standard]` remain in `requirements.txt` (they are already included).
+
 ## Contributing
 
 [![List of contributors](https://opencollective.com/instagrapi/contributors.svg?width=890&button=0)](https://github.com/subzeroid/instagrapi/graphs/contributors)
