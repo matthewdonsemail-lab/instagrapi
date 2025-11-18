@@ -49,8 +49,8 @@ def get_client() -> Client:
 
 app = FastAPI(
     title="Instagrapi API",
-    version="0.2.0",
-    description="REST API around instagrapi for followers/following and Direct messages.",
+    version="0.2.1",
+    description="REST API around instagrapi for followers/following, user stats and Direct messages.",
 )
 
 
@@ -76,6 +76,20 @@ class UserOut(BaseModel):
     following_count: Optional[int] = None
     biography: Optional[str] = None
     external_url: Optional[str] = None
+    is_business: Optional[bool] = None
+
+
+class UserStatsOut(BaseModel):
+    """
+    Lightweight view that lets you very quickly know
+    how big an account is without pulling all followers.
+    """
+    pk: int
+    username: str
+    follower_count: Optional[int] = None
+    following_count: Optional[int] = None
+    media_count: Optional[int] = None
+    is_private: Optional[bool] = None
     is_business: Optional[bool] = None
 
 
@@ -108,11 +122,21 @@ def health() -> dict:
 @app.get("/followers/{username}", response_model=List[UserShortOut])
 def get_followers(
     username: str,
-    amount: int = Query(10, ge=1, le=10000),
+    amount: int = Query(
+        10,
+        ge=0,
+        le=10000,
+        description="How many followers to return. 0 = ALL followers (slow on big accounts!)",
+    ),
 ):
     """
     Return up to `amount` followers for the given username.
+
     Uses cl.user_followers() which returns Dict[int, UserShort].
+
+    NOTE:
+    - amount=0 means "all followers" per instagrapi docs.
+      This is naturally slower for large accounts because it has to paginate.
     """
     cl = get_client()
 
@@ -122,7 +146,7 @@ def get_followers(
         raise HTTPException(status_code=404, detail="User not found")
 
     try:
-        followers = cl.user_followers(user_id, amount=amount)
+        followers = cl.user_followers(user_id, amount=amount or 0)
     except PrivateAccount:
         raise HTTPException(status_code=403, detail="Account is private")
 
@@ -145,7 +169,12 @@ def get_followers(
 @app.get("/following/{username}", response_model=List[UserShortOut])
 def get_following(
     username: str,
-    amount: int = Query(10, ge=1, le=10000),
+    amount: int = Query(
+        10,
+        ge=0,
+        le=10000,
+        description="How many accounts to return. 0 = ALL following (slow on big accounts!)",
+    ),
 ):
     """
     Return up to `amount` accounts this user is following.
@@ -159,7 +188,7 @@ def get_following(
         raise HTTPException(status_code=404, detail="User not found")
 
     try:
-        following = cl.user_following(user_id, amount=amount)
+        following = cl.user_following(user_id, amount=amount or 0)
     except PrivateAccount:
         raise HTTPException(status_code=403, detail="Account is private")
 
@@ -187,6 +216,10 @@ def search_followers(
 ):
     """
     Search within followers of a user using cl.search_followers().
+
+    This does NOT fetch all followers first – it uses the built-in search
+    which is much faster when you only care about matches for a query
+    like 'factory'.
     """
     cl = get_client()
 
@@ -253,6 +286,9 @@ def search_following(
 def get_user(username: str):
     """
     Full user profile info using cl.user_info_by_username().
+
+    Use this when you want follower_count / following_count etc,
+    but you do NOT need the full follower list.
     """
     cl = get_client()
 
@@ -277,6 +313,33 @@ def get_user(username: str):
         external_url=str(user.external_url)
         if getattr(user, "external_url", None)
         else None,
+        is_business=getattr(user, "is_business", None),
+    )
+
+
+@app.get("/users/{username}/stats", response_model=UserStatsOut)
+def get_user_stats(username: str):
+    """
+    Super-lightweight stats endpoint.
+
+    This calls cl.user_info_by_username() once and only returns the fields
+    you usually care about for sizing an account:
+    follower_count, following_count, media_count, is_private, is_business.
+    """
+    cl = get_client()
+
+    try:
+        user = cl.user_info_by_username(username)
+    except UserNotFound:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserStatsOut(
+        pk=user.pk,
+        username=user.username,
+        follower_count=getattr(user, "follower_count", None),
+        following_count=getattr(user, "following_count", None),
+        media_count=getattr(user, "media_count", None),
+        is_private=getattr(user, "is_private", None),
         is_business=getattr(user, "is_business", None),
     )
 
